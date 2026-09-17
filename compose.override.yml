@@ -1,0 +1,4 @@
+services:
+  wb2api:
+    ports: !override
+      - "127.0.0.1:7863:7863"

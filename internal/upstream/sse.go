@@ -244,6 +244,14 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			message["tool_calls"] = calls
 		}
 	}
+	// 工具调用标记泄漏（见 tool_markup.go）：文本通道先过守卫（截断/清空泄漏块），若全程
+	// 没有产出结构化 tool_calls 则判定上游把工具调用当正文吐出——不再合成假成功响应，
+	// 直接报错，由 handler 映射为 502（与空流同一口径）。
+	leaking, anyToolCall := false, false
+	guardToolMarkupFields(message, &leaking, &anyToolCall)
+	if leaking && !anyToolCall {
+		return nil, errToolMarkupLeak
+	}
 	resp := map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
@@ -477,7 +485,38 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 // error.gateway_hint。hintFn 为 nil 或返回空串 → 原样透传（零改写）。
 // 空流兜底 error 帧（"empty upstream stream"）不带 hint（网关本地故障形态
 // 未覆盖，不编造）。
+//
+// 本入口是「单次尝试 + 自行收尾」：泄漏时写 error 帧 + [DONE] 并返回哨兵错误。
+// 需要换号重发（工具调用标记泄漏）的调用方改用 StreamAttempt。
 func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) error {
+	_, err := streamCore(w, r, hintFn, true)
+	return err
+}
+
+// StreamOutcome 一次流式尝试的观测结果，供 handler 判断能否安全换号重发（见 tool_markup.go）：
+// 泄漏但**没有吐过正文、也没有 tool_calls** 时重发是安全的；一旦客户端已经拿到正文，
+// 重发只会把两段正文拼在一起，必须按失败收尾。
+type StreamOutcome struct {
+	ValidFrames int  // 有效 SSE 帧数（0 = 上游空流）
+	ContentText bool // 已透出正文（delta.content / message.content 非空）
+	ToolCalls   bool // 已透出结构化 tool_calls
+	Leaked      bool // 命中工具调用标记泄漏
+}
+
+// StreamAttempt 透传一次上游 SSE 尝试，把「要不要收尾」交给调用方：
+//   - 正常流：写 [DONE]，返回 outcome 与 nil；
+//   - 空流：写空流 error 帧 + [DONE]，返回 errEmptyStream（与 StreamHint 同语义；空流不重发）；
+//   - 泄漏但无 tool_calls：**不写 [DONE]、不写 error 帧**，并抑制该次尝试的 finish_reason，
+//     返回 errToolMarkupLeak——调用方可以换号重发，把新流续写在同一响应上；重发成功则照常
+//     收尾，重发预算用尽则由调用方 WriteToolMarkupLeakTail 收尾。
+func StreamAttempt(w http.ResponseWriter, r io.Reader, hintFn func(string) string) (StreamOutcome, error) {
+	return streamCore(w, r, hintFn, false)
+}
+
+// streamCore 是 Stream / StreamHint / StreamAttempt 的公共实现（规约只有一份）。
+// finalize 表示本次调用是否负责收尾：true → 泄漏也写 error 帧 + [DONE]（原语义）；
+// false → 把收尾权留给调用方（换号重发场景）。
+func streamCore(w http.ResponseWriter, r io.Reader, hintFn func(string) string, finalize bool) (out StreamOutcome, err error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -488,6 +527,14 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen := map[int]bool{}
+
+	// toolMarkupLeak / anyToolCall / contentText：工具调用标记泄漏守卫的状态（见 tool_markup.go）。
+	// 首帧命中即开始截断泄漏块（标记与载荷不再往后透出），流末尾若始终没有结构化
+	// tool_calls，则按 finalize 决定由谁收尾（error 帧 + [DONE]，或交给调用方重发）。
+	// contentText 记录「客户端是否已经拿到正文」——它决定重发是否安全（见 StreamOutcome）。
+	toolMarkupLeak := false
+	anyToolCall := false
+	contentText := false
 
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
@@ -530,6 +577,17 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 			}
 			// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
 			stripToolCallNames(obj, toolCallSeen)
+			// 工具调用标记泄漏守卫：命中即截断/清空该帧文本（见 tool_markup.go）。
+			guardFrameToolMarkup(obj, &toolMarkupLeak, &anyToolCall)
+			// 正文透出判定放在守卫之后：被截断掉的泄漏载荷不计入（见 StreamOutcome）。
+			if frameHasContent(obj) {
+				contentText = true
+			}
+			// 泄漏且无 tool_calls：抑制该次尝试的 finish_reason——调用方可能换号重发，
+			// 客户端不该在半途尝试上收尾（normalizeFrame 会把缺失的 finish_reason 写成 null）。
+			if toolMarkupLeak && !anyToolCall {
+				clearFinishReason(obj)
+			}
 			// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
 			// 有自己 id 的帧保持原样（不同流分裂的帧允许各自 id）。
 			if firstID == "" {
@@ -557,6 +615,13 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
+	// 出口统一回填观测结果：中途写失败也要带上已有观测（handler 据此决定能否重发）。
+	defer func() {
+		out.ValidFrames = validFrames
+		out.ContentText = contentText
+		out.ToolCalls = anyToolCall
+		out.Leaked = toolMarkupLeak
+	}()
 readLoop:
 	for {
 		line, err := br.ReadString('\n')
@@ -570,12 +635,12 @@ readLoop:
 			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
 			validFrames += n
 			if werr != nil {
-				return werr
+				return out, werr
 			}
 		case trimmed != "":
 			// 注释/其他行：原样透传
 			if _, werr := io.WriteString(w, line); werr != nil {
-				return werr
+				return out, werr
 			}
 			if fl != nil {
 				fl.Flush()
@@ -586,27 +651,55 @@ readLoop:
 			if err == io.EOF {
 				break
 			}
-			return err
+			return out, err
 		}
 	}
 	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
 	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
 	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
 	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
+	// 空流不参与换号重发：没有「半条流」可续写，语义仍由 handler 的既有分支收敛 502。
 	if validFrames == 0 {
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
-	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-		return err
+	// 工具调用标记泄漏且全程没有结构化 tool_calls：finalize（Stream/StreamHint）写 error 帧
+	// 收尾；StreamAttempt 则不收尾——调用方可能换号重发，把新流续写在同一响应上。
+	leakFailed := toolMarkupLeak && !anyToolCall
+	if leakFailed && finalize {
+		_ = writeRaw(toolMarkupLeakErrorFrame)
 	}
-	if fl != nil {
-		fl.Flush()
+	// [DONE]：空流、正常流、以及「泄漏但由本次调用收尾」都要写；泄漏且由调用方重发时不写
+	// （客户端要继续读下一条尝试的帧）。
+	if validFrames == 0 || !leakFailed || finalize {
+		if _, werr := io.WriteString(w, "data: [DONE]\n\n"); werr != nil {
+			return out, werr
+		}
+		if fl != nil {
+			fl.Flush()
+		}
 	}
 	if validFrames == 0 {
-		return errEmptyStream
+		return out, errEmptyStream
 	}
-	return nil
+	if leakFailed {
+		return out, errToolMarkupLeak
+	}
+	return out, nil
+}
+
+// WriteToolMarkupLeakTail 在换号重发预算用尽时收尾：写泄漏 error 帧 + 恰好一个 [DONE]。
+// 与 StreamAttempt 的「泄漏时不收尾」配对使用（见 handler 流式分支）。
+func WriteToolMarkupLeakTail(w http.ResponseWriter) {
+	writeSSERaw(w, toolMarkupLeakErrorFrame)
+	writeSSERaw(w, "[DONE]")
+}
+
+// writeSSERaw 原样写出一帧 SSE 并 flush（收尾助手用；不经 normalizeFrame、不加 gateway_hint）。
+func writeSSERaw(w http.ResponseWriter, payload string) {
+	_, _ = io.WriteString(w, "data: "+payload+"\n\n")
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
 }
 
 // frameGatewayHint 取 error 帧的 gateway_hint（hintFn 缺失/异常返回空串 → 不附加）。

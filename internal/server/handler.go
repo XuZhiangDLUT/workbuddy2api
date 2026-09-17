@@ -599,6 +599,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	// 工具调用标记泄漏的换号重发预算（见 upstream/tool_markup.go）：泄漏是上游偶发行为，
+	// 重发一次通常能拿到干净结果；预算用尽仍泄漏才按失败收尾。只重发一次，避免放大上游调用。
+	const maxLeakRetries = 1
+	leakRetries := 0
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -783,11 +788,36 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
 			// 组装请求上下文做判定）。
-			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
+			hintFn := upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}))
+			})
+			outcome, sErr := upstream.StreamAttempt(w, stats, hintFn)
+			// 工具调用标记泄漏且本轮**什么都没产出**（无正文、无 tool_calls，见
+			// upstream/tool_markup.go）：就地重发一次。StreamAttempt 在这种情形下不写 [DONE]
+			// 也不写 error 帧，重发的流会续写在同一条响应上，客户端最终拿到一份完整结果
+			// （第一段的思考无法收回，属已知取舍）。同号重发：泄漏是模型行为、与账号无关，
+			// 换号只会平白消耗轮转预算（账号少时还会因「无可用账号」丢掉这次重发机会）。
+			for upstream.IsToolMarkupLeakError(sErr) && !outcome.ContentText && !outcome.ToolCalls && leakRetries < maxLeakRetries {
+				leakRetries++
+				log.Printf("WARN: [server] stream acct=%s model=%s: tool-call markup leak with no output, retrying (%d/%d)", logfmt.Label(acct.UID, acct.Nickname), bareModel, leakRetries, maxLeakRetries)
+				rc2, _, _, terr2 := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+				if terr2 != nil || rc2 == nil {
+					break // 重发未成：落到下面的失败收尾
+				}
+				stats = newChatStatsReaderSince(rc2, st.start)
+				outcome, sErr = upstream.StreamAttempt(w, stats, hintFn)
+				rc2.Close()
+			}
+			if upstream.IsToolMarkupLeakError(sErr) {
+				// 预算用尽或已产出正文：写 error 帧 + [DONE] 收尾；这是上游缺陷不是成功——
+				// 日志/状态收敛到 502，与非流式 Aggregate → 502 同语义（客户端既无正文也无
+				// 工具调用时，agent 循环会把这一轮当「模型没话说」静默收尾）。
+				upstream.WriteToolMarkupLeakTail(w)
+				st.status = http.StatusBadGateway
+				log.Printf("WARN: [server] stream acct=%s model=%s: upstream leaked tool-call markup as text (no tool_calls)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
+			}
 			if upstream.IsEmptyStreamError(sErr) {
-				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
+				// 上游 200 但空流（0 有效帧）：StreamAttempt 已写 error 帧 + [DONE]
 				// 兜底（HTTP 头已发出只能 200），但这是上游缺陷不是成功——日志/
 				// 状态收敛到 502 观测，与非流式 Aggregate 空流→502 upstream_parse
 				// 同语义（此前 `_ =` 吞错把失败流记成 200，运维看到假成功）。
@@ -818,6 +848,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
+		// 工具调用标记泄漏（无 tool_calls，见 upstream/tool_markup.go）：客户端还没看到任何输出，
+		// 就地重发一次是安全的（同号——泄漏是模型行为、与账号无关，换号只会平白消耗轮转预算，
+		// 账号少时还会因「无可用账号」丢掉这次重发机会）。预算用尽才回 502。
+		for upstream.IsToolMarkupLeakError(err) && leakRetries < maxLeakRetries {
+			leakRetries++
+			log.Printf("WARN: [server] sync acct=%s model=%s: tool-call markup leak, retrying (%d/%d)", logfmt.Label(acct.UID, acct.Nickname), bareModel, leakRetries, maxLeakRetries)
+			rc2, _, _, terr2 := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+			if terr2 != nil || rc2 == nil {
+				break // 重发未成：落到下面按失败收尾
+			}
+			resp, err = upstream.Aggregate(rc2)
+			rc2.Close()
+		}
 		if err != nil {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
