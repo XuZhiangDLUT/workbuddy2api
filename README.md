@@ -148,7 +148,8 @@ cp config.example.json config.json
 编辑 `config.json`，**至少设置 `api_key`**（`留空 = 不鉴权`，公网部署务必设置）。示例中的 `test_key` 等均为占位符，`config.example.json` 不含任何真实密钥。
 
 ```bash
-# 登录添加账号（重复执行可加多号）
+# 登录添加账号（重复执行可加多号；注意：执行过下方说明中的 chown 后，
+# host 侧 login.sh 会被可写性预检拦截——此时请在容器内登录，见下方说明）
 ./login.sh
 
 # 启动服务
@@ -167,7 +168,7 @@ curl -s http://localhost:7863/healthz
 > chown -R 10001:10001 ./auths
 > ```
 >
-> 之后新增账号建议进**容器内**登录（`app` 自身落盘，属主即 10001，无需反复 chown；容器内无 docker CLI，完成后回宿主机重启）：
+> 之后新增账号**必须**进**容器内**登录（`app` 自身落盘，属主即 10001，无需反复 chown；chown 后 host 侧 `./login.sh` 无写权限，脚本会在启动浏览器授权前直接退出并提示，不会白走一遍 OAuth。容器内无 docker CLI，完成后回宿主机重启）：
 >
 > ```bash
 > docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api
@@ -190,6 +191,35 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o signin_bin ./cmd/signin
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o login ./cmd/login
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 ```
+
+#### Windows 原生运行（无需 Docker）
+
+Windows 10/11 自带的 PowerShell 与 `curl.exe` 即可管理后台进程。先准备配置并构建：
+
+```powershell
+Copy-Item config.example.json config.json
+# 编辑 config.json；建议把 listen 设为 127.0.0.1:7863，且务必设置 api_key
+
+go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
+go build -trimpath -ldflags="-s -w" -o login.exe ./cmd/login
+go build -trimpath -ldflags="-s -w" -o signin_bin.exe ./cmd/signin
+go build -trimpath -ldflags="-s -w" -o credit.exe ./cmd/credit
+```
+
+使用仓库自带脚本在后台启停并查看状态：
+
+```powershell
+.\start-workbuddy2api.cmd
+.\status-workbuddy2api.cmd
+.\stop-workbuddy2api.cmd
+```
+
+PID 写入 `wb2api.pid`，标准输出与错误日志分别写入 `data/server.out.log`、
+`data/server.err.log`。停止脚本会先验证 PID 对应的可执行文件确为当前目录下的
+`wb2api.exe`，不会因陈旧 PID 误杀其他进程。
+
+添加账号可使用配套管理面板，或在 Git Bash 中运行现有 `login.sh`（它还负责 CN
+首次签到以及 Global 注册地区/trial 流程；不建议只手工调用 `login.exe` 后跳过这些步骤）。
 
 ### 验证
 
