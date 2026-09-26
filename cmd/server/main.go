@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"workbuddy2api/internal/alert"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
@@ -154,13 +155,15 @@ func main() {
 		SchoolHours:         cfg.Schedule.SchoolHours,
 		CatHours:            cfg.Schedule.CatHours,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
-		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
-		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:      !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
-		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
-		CatDisabled:         !cfg.Schedule.CatEnabled,
+		// 触发时刻抖动窗口（schedule.jitter_minutes，0 = 精确整点 = 旧行为）。
+		JitterMinutes:      cfg.Schedule.JitterMinutes,
+		ExpiringSoonWindow: cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
+		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:     !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
+		SchoolDisabled:     !cfg.Schedule.SchoolEnabled,
+		CatDisabled:        !cfg.Schedule.CatEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -195,6 +198,30 @@ func main() {
 	} else {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
+	if cfg.Schedule.JitterMinutes > 0 {
+		log.Printf("排程抖动已启用：各任务触发时刻在名义整点后 0-%d 分钟内确定性偏移（schedule.jitter_minutes）",
+			cfg.Schedule.JitterMinutes)
+	}
+
+	// 管理操作审计（config admin.audit_enabled，默认关闭）：把 /admin 下每个动作
+	// 追加一行 JSONL 到磁盘。构造期做可写性预检并 fail-fast——路径不可写是审计最
+	// 常见的失效原因，且完全能在启动时发现；放到第一次管理操作才暴露，等于把一次
+	// 「配置错」推迟成「真出事时才发现审计是空的」，那正是审计最没用的时刻。
+	var auditLog *server.AuditLog
+	if cfg.Admin.AuditEnabled {
+		al, err := server.NewAuditLog(cfg.Admin.AuditFile, cfg.APIKey)
+		if err != nil {
+			log.Fatalf("管理操作审计初始化失败：%v", err)
+		}
+		auditLog = al
+		log.Printf("管理操作审计已启用：%s（每个 /admin 动作追加一行 JSONL）", al.Path())
+	}
+
+	// 当日积分预算闸（budget.daily_credit_limit，默认关闭）。
+	if cfg.Budget.DailyCreditLimit > 0 {
+		log.Printf("当日积分预算已启用：累计扣费达 %.2f credit 后拒服务（按 CST 自然日重置，实时用量见 /status 的 daily_budget）",
+			cfg.Budget.DailyCreditLimit)
+	}
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
@@ -210,11 +237,49 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
 		AdminEnabled: cfg.Admin.Enabled,
+		// Prometheus 指标端点开关（config metrics.enabled，默认 false）。
+		MetricsEnabled: cfg.Metrics.Enabled,
+		// 手动任务触发（admin.enabled 下的 /admin/tasks/{name}/run）：把调度器
+		// 作为 TaskRunner 注入，server 包不必反向 import scheduler。
+		Tasks: sch,
+		// 管理操作审计接收器（admin.audit_enabled，默认关闭时为零值 nil =
+		// 不审计、零开销）。
+		Audit: auditLog,
+		// 当日积分预算上限（budget.daily_credit_limit，0 = 关闭该闸）。
+		BudgetLimit: cfg.Budget.DailyCreditLimit,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+
+	// 可用性阈值告警（config alerting.enabled，默认关闭）：独立 ticker 评估只读健康
+	// 快照，越界时 POST 到运维自备的 webhook。与请求路径完全隔离，且从不调用上游。
+	alertMon := alert.New(alert.Config{
+		Enabled:          cfg.Alerting.Enabled,
+		WebhookURL:       cfg.Alerting.WebhookURL,
+		Secret:           cfg.Alerting.Secret,
+		Interval:         time.Duration(cfg.Alerting.IntervalSeconds) * time.Second,
+		Timeout:          time.Duration(cfg.Alerting.TimeoutSeconds) * time.Second,
+		StartupGrace:     time.Duration(cfg.Alerting.StartupGraceSeconds) * time.Second,
+		MinHealthyCN:     cfg.Alerting.MinHealthyCN,
+		MinHealthyGlobal: cfg.Alerting.MinHealthyGlobal,
+		RecoverHealthy:   cfg.Alerting.RecoverHealthy,
+		BreakerThreshold: cfg.Alerting.BreakerThreshold,
+		ForTicks:         cfg.Alerting.ForTicks,
+		ClearTicks:       cfg.Alerting.ClearTicks,
+		SendResolve:      cfg.Alerting.SendResolve,
+		ServiceName:      server.ServiceName,
+	}, alertSource{pool: p, h: h})
+	go alertMon.Run(ctx)
+	defer alertMon.Stop()
+	if !cfg.Alerting.Enabled {
+		log.Printf("可用性告警已禁用（alerting.enabled=false）")
+	} else {
+		log.Printf("可用性告警已启用：每 %ds 评估，健康阈值 cn=%d / global=%d（0=关闭该规则），熔断阈值=%d（0=关闭）",
+			cfg.Alerting.IntervalSeconds, cfg.Alerting.MinHealthyCN,
+			cfg.Alerting.MinHealthyGlobal, cfg.Alerting.BreakerThreshold)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

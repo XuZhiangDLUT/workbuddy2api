@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -51,6 +52,28 @@ type Config struct {
 	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
 	AdminEnabled bool
+
+	// MetricsEnabled Prometheus 指标端点开关（config metrics.enabled，默认 false）。
+	// 关闭时 /metrics 不注册（同 AdminEnabled 的条件注册理由：不向未鉴权探测暴露
+	// "这里有个指标面"）。开启后走 withAuth，与 /status、/v1/stats 同鉴权口径。
+	MetricsEnabled bool
+
+	// Tasks 手动触发排程任务的实现（admin_tasks.go）。nil = 未接线，此时
+	// /admin/tasks/* 回 503（不静默 404——"配置开了但没接线"要让运维看见）。
+	// 复用 admin.enabled 开关，不单开配置键：它只是账号管理端点的一个动作。
+	Tasks TaskRunner
+
+	// Audit 管理操作审计接收器（admin_audit.go）。nil = 不审计。
+	//
+	// 与 AdminEnabled 拆成两个开关：审计是「额外落一份磁盘文件」，老部署开了
+	// admin 也不该被动多出一个文件，故 config admin.audit_enabled 缺省关闭。
+	// 由 main 在启动期构造（NewAuditLog 会做可写性预检并 fail-fast）。
+	Audit *AuditLog
+
+	// BudgetLimit 当日累计 credit 上限（config budget.daily_credit_limit）。
+	// <=0 = 关闭该闸（不限），行为与引入前逐字一致。计数按 CST 自然日重置、
+	// 进程内不落盘（见 budget.go）。
+	BudgetLimit float64
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -85,6 +108,16 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// taskMu/taskRunning 手动任务触发的防重入闸（admin_tasks.go）：任务名 →
+	// 是否已有一次手动触发在跑。只挡「手动 vs 手动」连点；「手动 vs 定时」撞车
+	// 由 scheduler 自己的 checkinMu 兜。进程内状态、重启清零——重启后没有在跑的
+	// 手动任务，清零即正确，无需持久化。
+	taskMu      sync.Mutex
+	taskRunning map[string]bool
+
+	// budget 当日积分预算闸（budget.go）。恒非 nil（NewHandler 构造）；
+	// 仅当直接手搓 &Handler{} 时才为 nil，此时 admit/add 都是直通。
+	budget *dailyBudget
 }
 
 // NewHandler 构建 handler。
@@ -101,7 +134,12 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "passthrough" // 缺省 passthrough：透传客户端原始 system
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{
+		cfg:         cfg,
+		mux:         http.NewServeMux(),
+		taskRunning: map[string]bool{},
+		budget:      newDailyBudget(cfg.BudgetLimit),
+	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -114,9 +152,25 @@ func NewHandler(cfg Config) *Handler {
 	// 区分——路由一旦注册，"带 key 得 401 / GET 得 405 / JSON 信封 404" 三者都会
 	// 暴露管理面存在。
 	if cfg.AdminEnabled {
-		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
-		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
-		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
+		// 四条路由都包一层审计（config admin.audit_enabled，缺省关闭时 audit 是
+		// 直通、零开销）。审计在 withAuth **之内**：未通过鉴权的探测不落盘，
+		// 免得给匿名方一个「写运维磁盘」的口子（见 admin_audit.go 的 audit 注释）。
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable",
+			h.withAuth(h.audit("account.disable", auditPathValue("uid"), h.adminAccountDisable)))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable",
+			h.withAuth(h.audit("account.enable", auditPathValue("uid"), h.adminAccountEnable)))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive",
+			h.withAuth(h.audit("account.revive", auditPathValue("uid"), h.adminAccountRevive)))
+		// 手动触发排程任务（admin_tasks.go）：错过整点窗口时人工补跑一次，
+		// 不必等下一个整点。异步受理（202），同一任务在跑时回 409。
+		h.mux.HandleFunc("POST /admin/tasks/{name}/run",
+			h.withAuth(h.audit("task.run", auditPathValue("name"), h.adminTaskRun)))
+	}
+	// Prometheus 指标端点（默认关闭，config metrics.enabled 开启后生效）。
+	// 与 admin 同用条件注册：未开启时路径不存在，未鉴权探测无法区分它与真 404。
+	// 数据源全是进程内只读快照，scrape 不触发任何上游请求。
+	if cfg.MetricsEnabled {
+		h.mux.HandleFunc("GET /metrics", h.withAuth(h.promMetrics))
 	}
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
@@ -181,6 +235,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	// (域, 模型) 的最近探索时刻（键 "realm|model"）。与 accounts[].model_costs
 	// 行对照即可读出「探索→毕业」全链路（单一事实来源，不做双表示）。零回归只增键。
 	exploreEvents, exploreLast := h.cfg.Pool.CostExploreStatus()
+	// daily_budget 当日积分预算台账（budget.go）：已用 / 上限 / 当日被拒次数。
+	// 上限为 0 表示闸关闭（不限），此时 used 仍照常累计——运维可以先用观察模式
+	// 跑几天、看真实日耗再决定阈值，不必先开闸才知道该设多少。
+	budgetUsed, budgetLimit, budgetRejected := h.budget.snapshot()
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -200,6 +258,13 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,
 			"per_model":    exploreLast,
+		},
+		// daily_budget 按 CST 自然日重置，进程重启清零（见 budget.go）。
+		"daily_budget": map[string]any{
+			"used":     budgetUsed,
+			"limit":    budgetLimit,
+			"rejected": budgetRejected,
+			"day":      cstDay(time.Now()),
 		},
 	})
 }
@@ -316,9 +381,9 @@ func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
 		entry := map[string]any{
-			"id":                "cn:" + mi.ID,
-			"object":            "model",
-			"created":           1753600000,
+			"id":       "cn:" + mi.ID,
+			"object":   "model",
+			"created":  1753600000,
 			"owned_by": "workbuddy",
 		}
 		// context_length / max_output_tokens 四级查找（upstream.context_catalog +
@@ -470,6 +535,16 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// 当日积分预算闸（config budget.daily_credit_limit，缺省 0 = 关闭）。
+	// 位置在**读 body 之前**：被拒的请求不该先把几十 MB 请求体读进内存再丢掉。
+	// 429 是 OpenAI 对「配额耗尽」的既有语义（客户端会退避重试），code 取自定义值
+	// 以便与账号级限流（上游 429 转出的 soft_rate 路径）区分开。
+	if !h.budget.admit() {
+		used, limit, _ := h.budget.snapshot()
+		writeOpenAIError(w, http.StatusTooManyRequests, "daily_budget_exceeded",
+			fmt.Sprintf("daily credit budget exhausted (used %.2f of %.2f, resets at 00:00 CST)", used, limit))
+		return
+	}
 	// 请求体无大小上限（max_body_mb 已移除）：完整读入，超限类问题交由上游自然返回
 	// 错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断防御语义保留在
 	// 读错误路径——移除预拦截后，截断只可能来自客户端自己断流，读 body 出错就地 400，
@@ -500,7 +575,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	realm, bareModel := resolveModel(peek.Model)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, peek.Stream)
+	st := newChatStat(time.Now(), body, peek.Stream, h.budget)
 	defer st.done()
 
 	tried := map[string]bool{}
@@ -515,8 +590,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// stickyKey 是**粘性专用**键，与 sessKey（会话头族聚合用）分开：
 	// sessKey 为空时（OpenAI 兼容客户端——dsh / Codex 等既无 conversationId 也无
 	// metadata）用首条 user 消息派生会话级 fallback 键，使粘性仍能生效。
-	// 不能直接改 sessKey：那会连带改变上游头族 RequestIDForKey 的聚合语义
-	// （会话级 vs 轮级兜底），属于另一条链路的契约。
+	// 不能直接改 sessKey：那会连带改变上游头族轮级复合键（sessKey 入键）的聚合
+	// 语义，属于另一条链路的契约。
 	stickyKey := sessKey
 	if stickyKey == "" {
 		stickyKey = session.StickyFallbackKey(body)
@@ -534,15 +609,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 轮级兜底聚合键：无会话键的客户端（OpenAI 兼容协议——dsh / Codex / Cherry
-	// Studio 等请求体里既无 conversationId 也无 metadata）sessKey 恒空，会话头族的
-	// 聚合主键此前只能逐请求新生成，agent 多轮在上游用量明细里仍是一条请求一条记录。
-	// 这里按 body 里最后一条 user 消息派生轮级键（同轮内所有上游调用同键）。
+	// 轮级聚合键：按 body 里最后一条 user 消息派生（同轮内所有上游调用同键，
+	// 换 user 消息换键）。#170 起带会话键的客户端也统一走轮级（与官方桌面 CLI 的
+	// X-Conversation-Request-ID 轮级语义对齐），故不再限 sessKey=="" 才计算；
+	// sessKey 由调用侧以复合键方式入键（防不同会话同轮文本互撞）。
 	// 必须在下方 prompt.Rewrite / rewriteModel 之前取——改写会动 messages 内容。
-	turnKey := ""
-	if sessKey == "" {
-		turnKey = session.TurnKey(body)
-	}
+	turnKey := session.TurnKey(body)
 
 	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
 	// 同理）。11133「模型不支持图片」指向的前提。
@@ -601,27 +673,41 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = rewriteModel(body, bareModel)
 	}
 
-	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
-	// 官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。此处**轮转
-	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
-	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
-	// RequestID）。
+	// 会话头族（issue #35 / #170）：后台按 X-Conversation-Request-ID 聚合请求，官方
+	// 客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。**统一轮级**
+	// （对齐官方桌面 CLI：TraceStartHook 每次 USER_PROMPT_SUBMIT 清空重生成
+	// conversationRequestId，同轮内复用、跨轮必换；官方云链路 lfConvReqId 的会话级
+	// 是服务端指令，走本网关的客户端不属于该形态）。此处**轮转循环外**生成一次，
+	// 循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再碎片化（此前网关
+	// 一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个 RequestID）。
 	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造，见
 	//     ResolveConversationID；官方后台不校验一致，空会话则不建立聚合键）；
 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先（客户端已
-	//     有自己的对话轮 ID 则以客户端为准），否则按粘性 key 进程内稳定生成（同会话
-	//     恒同值）；粘性 key 也为空时走轮级兜底（session.TurnKey/TurnRequestID），
-	//     无 user 消息时退化成本请求级 NewMessageID——轮转内捕获一次即共享；
+	//     有自己的对话轮 ID 则以客户端为准）。派生分两态：
+	//     * turnKey 非空（有末条 user 消息）→ 带会话键客户端走 TurnRequestID(
+	//       sessKey+":"+turnKey) 复合键（会话段入键保证不同会话同轮文本不互撞，
+	//       轮级粒度对齐官方 CLI）；无会话键客户端走既有 TurnRequestID(turnKey)
+	//       纯轮级键（存量会话键值零漂移）。
+	//     * turnKey 为空（残留空态：无 user 消息/无可签名内容）→ sessKey 非空时
+	//       回落 RequestIDForKey(sessKey)（会话级兜底，好于请求级随机）；sessKey
+	//       也空走 NewMessageID 请求级（TurnRequestID 空键行为）——轮转内捕获
+	//       一次即共享。
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
 	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
+	} else if turnKey != "" && sessKey != "" {
+		// 轮级复合键：sessKey 入键防跨会话同轮文本互撞。
+		chatMeta.ConversationRequestID = session.TurnRequestID(sessKey + ":" + turnKey)
+	} else if turnKey != "" {
+		// 无会话键客户端：纯轮级键（既有兜底语义不变，存量会话键值零漂移）。
+		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
 	} else if sessKey != "" {
+		// 残留空态兜底：无轮可聚合时维持会话级聚合（同会话恒同值）。
 		chatMeta.ConversationRequestID = session.RequestIDForKey(sessKey)
 	} else {
-		// 无会话键客户端：轮级兜底——同轮内 tool call 多轮 / 换号重试 / 降级重发
-		// 共享同键，用户发下一条消息自动换键。
-		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
+		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
+		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
@@ -780,6 +866,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			// 图片格式/数据无效：立即透传上游原文回客户端，不罚号不轮转。
+			// 同一 body 换账号仍是同样的解析结果，轮转只会放大无效请求。
+			if kind == upstream.ErrImageInvalid {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "image request was rejected by upstream"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "image_invalid", msg,
+					h.hintOf(upstream.ErrImageInvalid, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				return
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -799,6 +899,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		// 响应头透出实际服务的账号：上游选号对客户端原本完全不可见——管理面板
+		// 的网关据此把每次成功请求记到账号名下（按账号的消耗统计），排障时也能
+		// 看到「这次是谁在答」。uid 是十六进制 ASCII，可直接进响应头；昵称可能
+		// 含非 ASCII，不入头（消费方按 uid 自行映射）。放在 NoteSuccess 之后：
+		// 头的语义是「这个号成功服务了本次请求」——中途失败换号的账号不冒领。
+		// 此时尚未写任何字节，流式（首帧前）与非流式（writeJSON 前）都生效。
+		w.Header().Set("X-Wb-Account", acct.UID)
 		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
@@ -990,7 +1097,7 @@ func rotateBackoff(i int, ctx context.Context) bool {
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
 // 会立即 400 返回，其余种类 continue 换号（continue 前由 rotateBackoff 退避）。
 //
-// 九条路径，各司其职：
+// 十条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
 //     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
@@ -1011,6 +1118,9 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     （同一 body 换任何号都超限）。零动作（不冷却/不熔断/不 NoteError、不喂连败，
 //     同 ErrContentBlocked 待遇），chatCompletions 已直接透传原文返回不轮转——
 //     该分支只为文档完备，不指望走到换号路径。
+//   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
+//     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
+//     不喂连败），chatCompletions 已直接透传原文返回不轮转。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
@@ -1101,6 +1211,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 号都超限）。零动作（不冷却/不熔断/不 NoteError，同 ErrContentBlocked
 		// 待遇），chatCompletions 已直接透传原文返回不轮转——该分支只为文档完备，
 		// 不指望走到换号路径。
+	case upstream.ErrImageInvalid:
+		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
+		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
