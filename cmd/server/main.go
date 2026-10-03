@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -21,6 +22,68 @@ import (
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
+
+// checkinReportFn 把 scheduler 的**进程内**签到接到 HTTP 入口（POST /v1/checkin）。
+//
+// ★ 直接调 CheckinAll，而不是 exec deploy/signin ★ 号池的 credits 只由 CheckinAll
+// 这条路径写入（SetCreditsDetailed）；外部 CLI 虽然能签到成功，但那是另一个进程，
+// 网关内存里的额度不会更新，控制台照样显示旧值 —— 这正是 2026-09-22 用户报的
+// 「额度没刷新」。详见 internal/server/checkin.go。
+func checkinReportFn(sch *scheduler.Scheduler, p *pool.Pool, cfg *Config) func() (server.CheckinReport, bool, error) {
+	return func() (server.CheckinReport, bool, error) {
+		outcomes, err := sch.CheckinAll()
+		if errors.Is(err, scheduler.ErrBusy) {
+			// 手动入口与定时撞车：不是错误，交给 handler 回 429 busy。
+			return server.CheckinReport{}, true, nil
+		}
+		if err != nil {
+			return server.CheckinReport{}, false, err
+		}
+		// realm 由号池现查（CheckinOutcome 本身不带 realm，免得 scheduler 与 pool
+		// 两处各存一份口径）；查不到留空，前端按「—」显示。
+		realmOf := func(uid string) string {
+			if a := p.AuthByUID(uid); a != nil {
+				return a.Realm()
+			}
+			return ""
+		}
+		return buildCheckinReport(outcomes, realmOf,
+			cfg.Schedule.CheckinEnabled, cfg.Schedule.CheckinHours), false, nil
+	}
+}
+
+// buildCheckinReport 把 scheduler 的结果映射成 HTTP 响应体（纯函数，便于单测：
+// 计数与 realm 归属错了不会报错，只会让面板显示错，必须锁住）。
+func buildCheckinReport(outcomes []scheduler.CheckinOutcome, realmOf func(string) string,
+	enabled bool, hours []int) server.CheckinReport {
+	rep := server.CheckinReport{
+		Enabled: enabled,
+		Hours:   hours,
+		Total:   len(outcomes),
+		Results: make([]server.CheckinResult, 0, len(outcomes)),
+	}
+	for _, o := range outcomes {
+		rep.Results = append(rep.Results, server.CheckinResult{
+			UID:      o.UID,
+			Nickname: o.Nickname,
+			Realm:    realmOf(o.UID),
+			Status:   string(o.Status),
+			Credits:  o.Credits,
+			Detail:   o.Detail,
+		})
+		switch o.Status {
+		case scheduler.CheckinOK:
+			rep.OK++
+		case scheduler.CheckinAlready:
+			rep.Already++
+		case scheduler.CheckinFail:
+			rep.Fail++
+		case scheduler.CheckinSkipped:
+			rep.Skipped++
+		}
+	}
+	return rep
+}
 
 // modelJSONPath 由 state.json 路径推导 model.json 路径（同目录同名换缀）：
 // 两者同为数据目录持久化物（Docker ./data volume），配套而非各自配置。
@@ -157,13 +220,20 @@ func main() {
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		// 触发时刻抖动窗口（schedule.jitter_minutes，0 = 精确整点 = 旧行为）。
 		JitterMinutes:      cfg.Schedule.JitterMinutes,
+		// 实例盐（schedule.jitter_salt，缺省空 = 与引入前逐字一致）。
+		JitterSalt: cfg.Schedule.JitterSalt,
 		ExpiringSoonWindow: cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
-		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:     !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
-		SchoolDisabled:     !cfg.Schedule.SchoolEnabled,
-		CatDisabled:        !cfg.Schedule.CatEnabled,
+		// 任务执行台账与当日失败重试（schedule.ledger_file / retry_*）。
+		// 重试默认关闭（RetryDelayMinutes=0），台账恒在（纯内存，除非给了落盘路径）。
+		LedgerFile:        cfg.Schedule.LedgerFile,
+		RetryDelayMinutes: cfg.Schedule.RetryDelayMinutes,
+		RetryMaxPerDay:    cfg.Schedule.RetryMaxPerDay,
+		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:    !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:  !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
+		SchoolDisabled:    !cfg.Schedule.SchoolEnabled,
+		CatDisabled:       !cfg.Schedule.CatEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -202,6 +272,21 @@ func main() {
 		log.Printf("排程抖动已启用：各任务触发时刻在名义整点后 0-%d 分钟内确定性偏移（schedule.jitter_minutes）",
 			cfg.Schedule.JitterMinutes)
 	}
+	// 任务执行台账与当日失败重试（schedule.ledger_file / retry_*）。
+	// 台账恒在（内存），落盘与否取决于 ledger_file；重试默认关闭。
+	if cfg.Schedule.LedgerFile != "" {
+		log.Printf("任务执行台账已落盘：%s（每类任务一轮执行后覆写，重启后仍可对账；实时视图见 /status 的 task_ledger）",
+			cfg.Schedule.LedgerFile)
+	} else {
+		log.Printf("任务执行台账仅在内存（schedule.ledger_file 为空，重启后只剩新跑过的记录）")
+	}
+	if cfg.Schedule.RetryDelayMinutes > 0 && cfg.Schedule.RetryMaxPerDay > 0 {
+		log.Printf("当日失败重试已启用：某类任务一轮「全灭」（有失败且无任何账号做成）后 %d 分钟补跑，每类每日最多 %d 次（schedule.retry_delay_minutes / retry_max_per_day）",
+			cfg.Schedule.RetryDelayMinutes, cfg.Schedule.RetryMaxPerDay)
+	} else {
+		log.Printf("当日失败重试已关闭（schedule.retry_delay_minutes=%d retry_max_per_day=%d；全灭只记 WARN 与台账，不自动补跑）",
+			cfg.Schedule.RetryDelayMinutes, cfg.Schedule.RetryMaxPerDay)
+	}
 
 	// 管理操作审计（config admin.audit_enabled，默认关闭）：把 /admin 下每个动作
 	// 追加一行 JSONL 到磁盘。构造期做可写性预检并 fail-fast——路径不可写是审计最
@@ -227,6 +312,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		AuthKeys:     buildAuthKeys(cfg),
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -247,6 +333,13 @@ func main() {
 		Audit: auditLog,
 		// 当日积分预算上限（budget.daily_credit_limit，0 = 关闭该闸）。
 		BudgetLimit: cfg.Budget.DailyCreditLimit,
+		// 任务执行台账只读视图（/status 的 task_ledger 段 + /metrics 的任务指标）。
+		// 与 Tasks 同款：*taskledger.Store 结构上即满足 server 侧的窄接口，
+		// server 包不必反向 import scheduler。
+		TaskLedger: sch.Ledger(),
+		// 手动签到入口（POST /v1/checkin）。★ 走进程内 CheckinAll ★ 外部 CLI
+		// 签到不会更新网关内存额度（见 internal/server/checkin.go 顶部注释）。
+		CheckinFn: checkinReportFn(sch, p, cfg),
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

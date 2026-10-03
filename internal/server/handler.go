@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -23,12 +24,28 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
+// AuthKey 一条鉴权密钥及其可见的**业务分组**（由 cmd/server 从 config 展开注入）。
+//
+// Groups 为空 = 不限分组：主密钥（config.api_key）与未配置分组的密钥都是这个语义，
+// 选号时不做分组过滤（= 改动前行为）。非空时，只有 auth 文件里打了同组标签的账号
+// 参与该密钥的选号（见 auth.Auth.MatchesGroups）。
+type AuthKey struct {
+	Key    string
+	Name   string
+	Groups []string
+}
+
 // Config handler 依赖。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	APIKey   string // 空 = 不鉴权；单密钥语义，AuthKeys 非空时以 AuthKeys 为准
+	// AuthKeys 鉴权密钥表（主密钥 + 分组密钥）。为空时回落 APIKey 单密钥语义。
+	//
+	// 鉴权时**遍历全表且不在命中处短路**（见 matchAuthKey）：多密钥下"命中即 break"
+	// 会让总耗时随匹配位置变化，等于把"某密钥是否存在、排第几"透给探测者。
+	AuthKeys  []AuthKey
+	MaxRotate int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -74,6 +91,54 @@ type Config struct {
 	// <=0 = 关闭该闸（不限），行为与引入前逐字一致。计数按 CST 自然日重置、
 	// 进程内不落盘（见 budget.go）。
 	BudgetLimit float64
+
+	// TaskLedger 任务执行台账的只读视图（/status 的 task_ledger 段 + /metrics 的
+	// 任务指标）。nil = 未接线，此时两处都不含任务维度——与 Pool/Upstream 的
+	// 接线风格一致，测试可注入假台账。
+	//
+	// 用窄接口而非直接依赖 internal/scheduler：server 包不反向 import scheduler
+	// （理由见 admin_tasks.go 的 TaskRunner 注释）。台账的数据结构与存储放在
+	// internal/taskledger，两个包都只依赖它，不产生环。
+	TaskLedger TaskLedgerReader
+
+	// CheckinFn 手动触发一次全量签到（POST /v1/checkin），返回报告。
+	//
+	// ★ 必须在网关**进程内**执行 ★ 号池的 credits 只由 scheduler.CheckinAll 写入
+	// （SetCreditsDetailed）；改用外部 CLI（deploy/signin）签到虽然上游确实签到了，
+	// 但**不会**更新网关内存里的额度 —— 这正是「签到成功、控制台积分却不刷新」的
+	// 成因。故这里要求的是一个能直接跑 CheckinAll 的回调，而不是去 exec 一个 CLI。
+	//
+	// busy=true 表示已有一次签到正在跑（scheduler.ErrBusy：手动入口与定时撞车），
+	// 调用方应回 429 提示稍后再试。nil = 未接线（如测试），端点回 501。
+	CheckinFn func() (report CheckinReport, busy bool, err error)
+}
+
+// CheckinResult 单账号签到结果（POST /v1/checkin 返回体的 results 元素）。
+type CheckinResult struct {
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Realm    string `json:"realm,omitempty"`
+	// Status ok（签到成功）/ already（上游判定今天已签，幂等）/ fail / skipped。
+	Status string `json:"status"`
+	// Credits 签到后的余额；仅余额查询成功时非 nil。
+	// ★ global 账号也走这条路 ★ 它们跳过签到（无签到体系），但余额查询是号池
+	// 「剩余积分」的唯一数据源，故仍会出现在 results 里。
+	Credits *int64 `json:"credits,omitempty"`
+	// Detail 失败/跳过原因（成功与「已签到」不填）。
+	Detail string `json:"detail,omitempty"`
+}
+
+// CheckinReport 一次全量签到的报告。
+type CheckinReport struct {
+	// Enabled 排程是否启用（schedule.checkin_enabled）；false 时手动入口仍可用。
+	Enabled bool            `json:"enabled"`
+	Hours   []int           `json:"hours"` // 自动签到时点（本地小时）
+	Total   int             `json:"total"`
+	OK      int             `json:"ok"`
+	Already int             `json:"already"`
+	Fail    int             `json:"fail"`
+	Skipped int             `json:"skipped"`
+	Results []CheckinResult `json:"results"`
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -118,6 +183,11 @@ type Handler struct {
 	// budget 当日积分预算闸（budget.go）。恒非 nil（NewHandler 构造）；
 	// 仅当直接手搓 &Handler{} 时才为 nil，此时 admit/add 都是直通。
 	budget *dailyBudget
+
+	// lastCheckinUnix 上次手动签到**完成**时刻（unix 秒）。给 POST /v1/checkin 加一个
+	// 短冷却：一次签到会对每个账号打 2~3 次上游（refresh / daily-checkin / balance），
+	// 被脚本连点会成倍放大上游压力（含住宅代理出口的 WAF 风险）。进程内状态、重启清零。
+	lastCheckinUnix atomic.Int64
 }
 
 // NewHandler 构建 handler。
@@ -145,6 +215,11 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
+	// 手动签到入口（POST /v1/checkin）。**不**挂在 admin.enabled 闸下：签到是
+	// 幂等的余额刷新（不改变账号可用性），与 /admin/accounts/* 的 disable/revive
+	// 不同量级，和 /v1/stats/reset 同类；且控制台要开箱可用，不该要求先开管理面。
+	// 仍需 api_key（withAuth）+ 30s 冷却，防脚本连点放大上游压力。
+	h.mux.HandleFunc("POST /v1/checkin", h.withAuth(h.checkin))
 	// 运维管理端点（默认关闭，config admin.enabled 开启后生效）。
 	// 路径用 {uid} 通配而非查询参数：uid 是账号身份，放进路径便于审计与直观。
 	// 条件注册而非 handler 内 404（设计 supplement §2.3）：未注册的路由对未鉴权
@@ -155,16 +230,28 @@ func NewHandler(cfg Config) *Handler {
 		// 四条路由都包一层审计（config admin.audit_enabled，缺省关闭时 audit 是
 		// 直通、零开销）。审计在 withAuth **之内**：未通过鉴权的探测不落盘，
 		// 免得给匿名方一个「写运维磁盘」的口子（见 admin_audit.go 的 audit 注释）。
+		//
+		// withOps 夹在 withAuth 与 audit 之间（P0-1 实施时发现的提权面）：
+		// withAuth 只认「密钥在表里」，而密钥表含 config.api_keys 里的**分组密钥**
+		// ——那是发给外部调用方的受限调用凭证。若不在管理面额外收紧，开
+		// admin.enabled 就等于把 disable/revive/refresh 开给外部用户。被 withOps
+		// 拒绝的请求**不进 audit**：否则外部用户的一次探测就能往运维磁盘写一行。
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable",
-			h.withAuth(h.audit("account.disable", auditPathValue("uid"), h.adminAccountDisable)))
+			h.withAuth(withOps(h.audit("account.disable", auditPathValue("uid"), h.adminAccountDisable))))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable",
-			h.withAuth(h.audit("account.enable", auditPathValue("uid"), h.adminAccountEnable)))
+			h.withAuth(withOps(h.audit("account.enable", auditPathValue("uid"), h.adminAccountEnable))))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive",
-			h.withAuth(h.audit("account.revive", auditPathValue("uid"), h.adminAccountRevive)))
+			h.withAuth(withOps(h.audit("account.revive", auditPathValue("uid"), h.adminAccountRevive))))
+		// 立即续期（P0-1）：对单个账号显式跑一次 token 续期，用来区分
+		// 「凭证真死了」与「账号被禁用后保活跳过了它，所以过期状态永远不消失」
+		// （RunKeepaliveNow 首句 `if st.Disabled { continue }`）。有了它，
+		// 验证一个 disabled 号还能不能救，不必再停服改 state.json。
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/refresh",
+			h.withAuth(withOps(h.audit("account.refresh", auditPathValue("uid"), h.adminAccountRefresh))))
 		// 手动触发排程任务（admin_tasks.go）：错过整点窗口时人工补跑一次，
 		// 不必等下一个整点。异步受理（202），同一任务在跑时回 409。
 		h.mux.HandleFunc("POST /admin/tasks/{name}/run",
-			h.withAuth(h.audit("task.run", auditPathValue("name"), h.adminTaskRun)))
+			h.withAuth(withOps(h.audit("task.run", auditPathValue("name"), h.adminTaskRun))))
 	}
 	// Prometheus 指标端点（默认关闭，config metrics.enabled 开启后生效）。
 	// 与 admin 同用条件注册：未开启时路径不存在，未鉴权探测无法区分它与真 404。
@@ -180,18 +267,74 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// authKeyTable 返回生效的鉴权密钥表：
+//   - AuthKeys 非空（cmd/server 已展开「主密钥 + config.api_keys」）→ 用它；
+//   - 否则回落 APIKey 单密钥（老调用方/测试直接构造 Config 的路径）；
+//   - 两者皆空 → nil，即"不鉴权部署"（现状语义）。
+func (h *Handler) authKeyTable() []AuthKey {
+	if len(h.cfg.AuthKeys) > 0 {
+		return h.cfg.AuthKeys
+	}
+	if k := strings.TrimSpace(h.cfg.APIKey); k != "" {
+		return []AuthKey{{Key: k, Name: "api_key"}}
+	}
+	return nil
+}
+
+// matchAuthKey 在密钥表里找出请求所带的 Bearer 密钥，返回命中的条目（无则 nil）。
+//
+// ★ 时序：遍历**全部**条目、命中也不提前 break ★ ConstantTimeCompare 只保证单次
+// 比较不泄漏字节；一旦"命中即 return"，比较**次数**（即总耗时）就与命中位置相关，
+// 多密钥下等于把"某密钥是否存在、排第几"透出去（单密钥时代不存在这个问题，这是
+// 引入多密钥时新生的信号面）。故用累加式记录而不是短路返回。
+//
+// 返回**副本**而非表内元素地址：调用方会把它放进 request context、随请求流转，
+// 不该与配置切片的生命周期耦合。
+func matchAuthKey(keys []AuthKey, authz string) *AuthKey {
+	if !strings.HasPrefix(authz, "Bearer ") {
+		return nil
+	}
+	provided := []byte(strings.TrimPrefix(authz, "Bearer "))
+	var hit *AuthKey
+	for i := range keys {
+		if subtle.ConstantTimeCompare(provided, []byte(keys[i].Key)) == 1 {
+			cp := keys[i]
+			// 深拷贝 Groups：结构体赋值只复制切片头，底层数组仍与配置共享 ——
+			// 调用方（或将来插进来的中间件）一旦改写就会污染全局配置。
+			if len(cp.Groups) > 0 {
+				g := make([]string, len(cp.Groups))
+				copy(g, cp.Groups)
+				cp.Groups = g
+			}
+			hit = &cp
+		}
+	}
+	return hit
+}
+
+// ctxKeyAuthKey 请求上下文键：本次请求命中的密钥条目。
+type ctxKeyAuthKey struct{}
+
+// authKeyFrom 取出上下文里命中的密钥（不鉴权部署或未经 withAuth 时为 nil）。
+// nil 的语义 = **不限分组**，调用方据此退化到改动前的选号行为。
+func authKeyFrom(ctx context.Context) *AuthKey {
+	ki, _ := ctx.Value(ctxKeyAuthKey{}).(*AuthKey)
+	return ki
+}
+
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.cfg.APIKey != "" {
-			authz := r.Header.Get("Authorization")
+		if keys := h.authKeyTable(); len(keys) > 0 {
 			// 常量时间比较（发现 7）：!= 短路时序随前缀长度变化，公网暴露下
 			// 理论上可逐字节探测 key 前缀；ConstantTimeCompare 消除该信号。
-			provided := strings.TrimPrefix(authz, "Bearer ")
-			if !strings.HasPrefix(authz, "Bearer ") ||
-				subtle.ConstantTimeCompare([]byte(provided), []byte(h.cfg.APIKey)) != 1 {
+			// 多密钥遍历的时序约束见 matchAuthKey 注释。
+			matched := matchAuthKey(keys, r.Header.Get("Authorization"))
+			if matched == nil {
 				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 				return
 			}
+			// 把命中的密钥（含其可见分组）带进上下文，供选号链路取用。
+			r = r.WithContext(context.WithValue(r.Context(), ctxKeyAuthKey{}, matched))
 		}
 		next(w, r)
 	}
@@ -241,7 +384,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	budgetUsed, budgetLimit, budgetRejected := h.budget.snapshot()
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"accounts":       h.cfg.Pool.List(),
 		"total":          total,
 		"healthy":        healthy,
@@ -266,7 +409,13 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			"rejected": budgetRejected,
 			"day":      cstDay(time.Now()),
 		},
-	})
+	}
+	// task_ledger 六类任务「最近一轮」的结果 + 当日失败重试状态（task_ledger.go）。
+	// 未接线时不写该键（而非写 null）：老部署与测试的响应体形状保持不变。
+	if tl := h.taskLedgerStatus(); tl != nil {
+		body["task_ledger"] = tl
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // countsMapFrom 把 CountsDetailed 五元组编码为 /status realm_totals 的字段对象。
@@ -716,20 +865,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	const maxLeakRetries = 1
 	leakRetries := 0
 
+	// 本次请求密钥的**可见业务分组**（nil = 不限分组：主密钥 / 未配置 api_keys）。
+	// 鉴权已在 withAuth 完成并把命中的密钥条目注入 context；此处只取值。
+	// ★ 选号链路的每一处都必须带上它 ★（普通轮换、全冷却兜底、粘性命中），
+	// 漏掉任何一处就是一个隔离缺口，而且缺口只在特定时序下才暴露。
+	var keyGroups []string
+	if ki := authKeyFrom(r.Context()); ki != nil {
+		keyGroups = ki.Groups
+	}
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
+			// 粘性命中同样受分组约束：绑定号若属于其他密钥的分组，返回 nil → 解绑重分配。
+			acct = h.cfg.Pool.PickByUIDForModelGroups(stickyUID, bareModel, keyGroups)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
-				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
+				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）、realm 不符，
+				// 或不在本次密钥的可见分组内 → 解绑。
 				unbindSticky()
 			}
 		}
 		if acct == nil {
-			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
-			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			// 模型感知 + realm 感知 + 分组感知选号：模型非空时启用 6004 模型级冷却
+			// 豁免（healthyForModel），realm 谓词过滤跨域账号，groups 谓词过滤跨组账号。
+			acct = h.cfg.Pool.PickExcludingForRealmGroups(tried, bareModel, realm, keyGroups)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -758,6 +918,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
+				h.cfg.Pool.NoteRefreshFail(acct.UID, err) // P0-1 续期观测台账（只记录，不判罚）
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
@@ -773,7 +934,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
-			acct.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
+			h.cfg.Pool.NoteRefreshOK(acct.UID) // P0-1：续期成功，留证（与失败分支对称）
+			acct.BackfillRealm()               // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
 				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)

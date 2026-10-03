@@ -1,0 +1,65 @@
+# PR 测试门禁 —— 这是自动合并的前提，不是可选项。
+#
+# 为什么必须有：仓库此前在 PR 上不跑任何测试。#3 那种「测试全绿、功能却从未生效」的改动
+# 就是这样溜进 master 的（它的测试把错误的 GET 断言成了正确契约，直到 #11 才发现）。
+# 自动合并不能建在没有测试门禁的地基上 —— 否则 AI 的判定就是唯一闸门。
+#
+# master 的分支保护把本工作流的 test 检查列为必需，原生 auto-merge 才会等它通过再合并。
+#
+# 【为什么用 pull_request_target 而不是 pull_request】
+# 必需检查 test 必须**总能上报**。此前只有 pull_request 触发，而来自 fork 的运行会被 GitHub
+# 挂起等维护者点「Approve workflows to run」（仓库 approval_policy = first_time_contributors）：
+# 批准之前 test 永远不出结果，PR 永远 BLOCKED —— 即使 AI 已经打了 ai-approved、auto-merge 也
+# 已经启用，也只能无限等待（#19 就是这样卡住的，补上批准后立刻自动合并；#21 是同一个作者的
+# fork 提交，卡在同一处）。
+# pull_request_target 不受该约束，而且工作流定义固定取默认分支上的这一份 —— PR 改不动 CI
+# 要跑什么，这一点比 pull_request 更不容易被贡献者改写。
+#
+# 维护提示：分支保护里的必需检查必须由不受该批准策略约束的事件产出（就是本文件现在这样）。
+# 新增必需检查或改回 pull_request 触发，都会重新引入「批准前拿不到检查结果、auto-merge 无限
+# 等待」的死锁 —— 而换触发方式本身无法自证（该事件只认默认分支上的定义），需要分两步灰度。
+name: PR CI
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  # pull_request_target 下 GITHUB_TOKEN 默认是读写；必须显式钉死只读，
+  # 因为下面会检出并执行不可信代码（这是该事件的标准加固方式）。
+  # 本工作流不引用任何 secret，所以不可信代码拿不到任何凭据。
+  contents: read
+
+concurrency:
+  # 同一个 PR 的新推送取消上一轮（省 runner，也避免旧结论覆盖新结论）
+  group: pr-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # 检查名就是 job 名；分支保护的必需检查按这个名字匹配，改名要同步改分支保护
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # 测的是「合并后的结果」：与 GitHub 在 pull_request 下的默认检出等价。
+          # merge_commit_sha 为空时（无法计算合并，例如有冲突）退化到 PR 头部提交，
+          # 此时 PR 本来也合不了。
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # 关掉缓存：pull_request_target 下缓存是可写的，而本工作流会执行不可信代码；
+          # 避免 PR 运行往 Go 缓存（以及 build.yml 复用的 GHA docker 缓存）里写东西。
+          cache: false
+
+      # 不加 gofmt 门禁：仓库现有文件并未整体 gofmt 干净，加进来会立刻全红
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./...
