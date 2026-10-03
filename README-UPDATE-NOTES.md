@@ -7,7 +7,7 @@
 
 | 提交 | 内容 | 验证方法 |
 |---|---|---|
-| `c240a1b` | feat(upstream): 检测 workbuddy 把 tool-call markup 以正文形式泄漏 | `grep -c detectWorkbuddyToolMarkup internal/upstream/tool_markup.go` |
+| `c240a1b` | feat(upstream): 检测 workbuddy 把 tool-call markup 以正文形式泄漏 | `grep -c IsToolMarkupLeakError internal/upstream/tool_markup.go` |
 | `76a64eb` | fix(stream): tool-call markup 泄漏时同号原地重发一次 | `grep -c guardToolMarkupFields internal/upstream/sse.go`；运行中容器：`docker exec workbuddy2api grep -c guardToolMarkupFields /app/wb2api` |
 
 合并后跑测试：`docker run --rm -v $PWD:/src -w /src golang:1.26-alpine go test ./...`
